@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 
-type StepId = "title" | "concept" | "plotOverview" | "script" | "storyboard";
+type StepId = "title" | "concept" | "plotOverview" | "script" | "visualStyle";
 
 type Step = {
   id: StepId;
@@ -42,10 +42,10 @@ const steps: Step[] = [
     rows: 7,
   },
   {
-    id: "storyboard",
-    label: "Storyboard",
-    prompt: "Describe the visual storyboard and key shots.",
-    placeholder: "Shot list, mood, camera direction, and visual style...",
+    id: "visualStyle",
+    label: "Visual Style",
+    prompt: "Describe the visual style.",
+    placeholder: "Realism, anime...",
     rows: 6,
   },
 ];
@@ -55,7 +55,7 @@ const emptyAnswers: Record<StepId, string> = {
   concept: "",
   plotOverview: "",
   script: "",
-  storyboard: "",
+  visualStyle: "",
 };
 
 export default function Home() {
