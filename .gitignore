@@ -34,8 +34,9 @@ yarn-error.log*
 .env*
 API_KEYS.md
 
-# vercel
-.vercel
+# firebase local state
+.firebase/
+firebase-debug.log*
 
 # typescript
 *.tsbuildinfo

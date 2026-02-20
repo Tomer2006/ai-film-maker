@@ -1,0 +1,15 @@
+runConfig:
+  minInstances: 0
+  maxInstances: 3
+
+env:
+  - variable: OPENCODE_BASE_URL
+    secret: opencode-base-url
+  - variable: OPENCODE_SERVER_USERNAME
+    secret: opencode-server-username
+  - variable: OPENCODE_SERVER_PASSWORD
+    secret: opencode-server-password
+  - variable: OPENCODE_MODEL
+    secret: opencode-model
+  - variable: SHOTSTACK_WEBHOOK_SECRET
+    secret: shotstack-webhook-secret

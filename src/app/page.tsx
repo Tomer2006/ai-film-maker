@@ -1,11 +1,23 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { useMutation, useQuery } from "convex/react";
-import type { FunctionReference } from "convex/server";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type StepId = "title" | "concept" | "plotOverview" | "script" | "visualStyle";
 type JobStatus = "queued" | "generating" | "completed" | "failed";
+type JobStage =
+  | "queued"
+  | "pre_production"
+  | "production_pending"
+  | "production"
+  | "idea"
+  | "story"
+  | "screenplay"
+  | "scene_plan"
+  | "planning"
+  | "scene_generation"
+  | "assembly"
+  | "completed"
+  | "failed";
 
 type Step = {
   id: StepId;
@@ -27,7 +39,8 @@ const steps: Step[] = [
     id: "concept",
     label: "Concept",
     prompt: "Describe the core concept in one or two sentences.",
-    placeholder: "Example: A retired astronaut trains a crew of teenagers to stop a lunar mining war.",
+    placeholder:
+      "Example: A retired astronaut trains a crew of teenagers to stop a lunar mining war.",
     rows: 4,
   },
   {
@@ -61,42 +74,85 @@ const emptyAnswers: Record<StepId, string> = {
   visualStyle: "",
 };
 
-type QueryRef = FunctionReference<"query">;
-type MutationRef = FunctionReference<"mutation">;
-
 type Job = {
-  _id: string;
+  id: string;
   status: JobStatus;
+  stage?: JobStage;
   progress: number;
   message: string;
+  totalScenes?: number;
+  completedScenes?: number;
   finalVideoUrl?: string;
   error?: string;
   movieTitle: string;
   createdAt: number;
 };
 
+type CreativeFile = {
+  id: string;
+  jobId: string;
+  movieId: string;
+  fileKey: string;
+  title: string;
+  fileName: string;
+  sortOrder: number;
+  content: string;
+  revision: number;
+  updatedBy: "system" | "opencode" | "user";
+  createdAt: number;
+  updatedAt: number;
+};
+
+type SaveState = "idle" | "saving" | "saved" | "error";
+
 const DEMO_USER_ID = "demo-user";
-const createMovieAndStartJobRef =
-  "movies:createMovieAndStartJob" as unknown as MutationRef;
-const listJobsByUserRef = "movies:listJobsByUser" as unknown as QueryRef;
-const getJobRef = "movies:getJob" as unknown as QueryRef;
+const PRE_PRODUCTION_FILE_ORDER = [
+  "title",
+  "concept",
+  "plot_overview",
+  "visual_style",
+  "script",
+  "storyboard_text",
+] as const;
+const PRE_PRODUCTION_SET = new Set<string>(PRE_PRODUCTION_FILE_ORDER);
+
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init);
+  const payload = (await response.json().catch(() => ({}))) as Record<
+    string,
+    unknown
+  >;
+
+  if (!response.ok) {
+    const message =
+      typeof payload.error === "string"
+        ? payload.error
+        : `Request failed (${response.status})`;
+    throw new Error(message);
+  }
+
+  return payload as T;
+}
 
 export default function Home() {
   const [stepIndex, setStepIndex] = useState(0);
   const [answers, setAnswers] = useState<Record<StepId, string>>(emptyAnswers);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [activeJob, setActiveJob] = useState<Job | null>(null);
+  const [jobs, setJobs] = useState<Job[]>([]);
   const [isSubmittingJob, setIsSubmittingJob] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
-
-  const createMovieAndStartJob = useMutation(createMovieAndStartJobRef);
-  const jobs = (useQuery(listJobsByUserRef, {
-    userId: DEMO_USER_ID,
-  }) as Job[] | undefined) ?? [];
-  const activeJob = (useQuery(
-    getJobRef,
-    activeJobId ? { jobId: activeJobId } : "skip",
-  ) as Job | null | undefined) ?? null;
-  const convexConfigured = Boolean(process.env.NEXT_PUBLIC_CONVEX_URL);
+  const [jobsError, setJobsError] = useState<string | null>(null);
+  const [creativeFiles, setCreativeFiles] = useState<CreativeFile[]>([]);
+  const [selectedFileKey, setSelectedFileKey] = useState<string | null>(null);
+  const [draftByKey, setDraftByKey] = useState<Record<string, string>>({});
+  const [saveStateByKey, setSaveStateByKey] = useState<Record<string, SaveState>>(
+    {},
+  );
+  const [filesError, setFilesError] = useState<string | null>(null);
+  const [isStartingProduction, setIsStartingProduction] = useState(false);
+  const saveTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const dirtyByKeyRef = useRef<Record<string, boolean>>({});
 
   const isReview = stepIndex >= steps.length;
   const currentStep = steps[stepIndex];
@@ -105,6 +161,193 @@ export default function Home() {
     () => Math.round((Math.min(stepIndex, steps.length) / steps.length) * 100),
     [stepIndex],
   );
+  const preProductionFiles = useMemo(() => {
+    const order: Record<string, number> = {};
+    PRE_PRODUCTION_FILE_ORDER.forEach((key, index) => {
+      order[key] = index;
+    });
+
+    return creativeFiles
+      .filter((file) => PRE_PRODUCTION_SET.has(file.fileKey))
+      .sort((a, b) => (order[a.fileKey] ?? 999) - (order[b.fileKey] ?? 999));
+  }, [creativeFiles]);
+  const selectedFile = useMemo(
+    () => preProductionFiles.find((file) => file.fileKey === selectedFileKey) ?? null,
+    [preProductionFiles, selectedFileKey],
+  );
+
+  const loadJobs = useCallback(async () => {
+    try {
+      const result = await fetchJson<{ jobs: Job[] }>(
+        `/api/jobs?userId=${encodeURIComponent(DEMO_USER_ID)}`,
+      );
+      setJobs(result.jobs);
+      setJobsError(null);
+    } catch (error) {
+      setJobsError(
+        error instanceof Error ? error.message : "Failed to load jobs.",
+      );
+    }
+  }, []);
+
+  const loadActiveJob = useCallback(async (jobId: string) => {
+    try {
+      const result = await fetchJson<{ job: Job | null }>(`/api/jobs/${jobId}`);
+      setActiveJob(result.job);
+    } catch (error) {
+      setSubmitError(
+        error instanceof Error ? error.message : "Failed to load active job.",
+      );
+    }
+  }, []);
+
+  const loadCreativeFiles = useCallback(async (jobId: string) => {
+    try {
+      const result = await fetchJson<{ files: CreativeFile[] }>(
+        `/api/jobs/${jobId}/files`,
+      );
+      const files = result.files.filter((file) =>
+        PRE_PRODUCTION_SET.has(file.fileKey),
+      );
+
+      setCreativeFiles(files);
+      setFilesError(null);
+      setSelectedFileKey((prev) => {
+        if (prev && files.some((file) => file.fileKey === prev)) {
+          return prev;
+        }
+        return files[0]?.fileKey ?? null;
+      });
+
+      setDraftByKey((prev) => {
+        const next: Record<string, string> = {};
+        for (const file of files) {
+          if (dirtyByKeyRef.current[file.fileKey]) {
+            next[file.fileKey] = prev[file.fileKey] ?? file.content;
+          } else {
+            next[file.fileKey] = file.content;
+          }
+        }
+        return next;
+      });
+    } catch (error) {
+      setFilesError(
+        error instanceof Error ? error.message : "Failed to load documents.",
+      );
+    }
+  }, []);
+
+  const saveFile = useCallback(
+    async (fileKey: string, content: string) => {
+      if (!activeJobId) return;
+
+      setSaveStateByKey((prev) => ({ ...prev, [fileKey]: "saving" }));
+      try {
+        await fetchJson<{ ok: true }>(`/api/jobs/${activeJobId}/files/${fileKey}`, {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ content }),
+        });
+
+        dirtyByKeyRef.current[fileKey] = false;
+        setSaveStateByKey((prev) => ({ ...prev, [fileKey]: "saved" }));
+        setCreativeFiles((prev) =>
+          prev.map((file) =>
+            file.fileKey === fileKey
+              ? {
+                  ...file,
+                  content,
+                  revision: file.revision + 1,
+                  updatedBy: "user",
+                  updatedAt: Date.now(),
+                }
+              : file,
+          ),
+        );
+      } catch {
+        setSaveStateByKey((prev) => ({ ...prev, [fileKey]: "error" }));
+      }
+    },
+    [activeJobId],
+  );
+
+  const startProductionStep = useCallback(async () => {
+    if (!activeJobId) return;
+
+    setIsStartingProduction(true);
+    setSubmitError(null);
+
+    try {
+      await fetchJson<{ ok: true }>(`/api/jobs/${activeJobId}/start-production`, {
+        method: "POST",
+      });
+      await loadActiveJob(activeJobId);
+      await loadJobs();
+    } catch (error) {
+      setSubmitError(
+        error instanceof Error ? error.message : "Failed to start Step 2 production.",
+      );
+    } finally {
+      setIsStartingProduction(false);
+    }
+  }, [activeJobId, loadActiveJob, loadJobs]);
+
+  useEffect(() => {
+    void loadJobs();
+    const timer = setInterval(() => {
+      void loadJobs();
+    }, 5000);
+
+    return () => clearInterval(timer);
+  }, [loadJobs]);
+
+  useEffect(() => {
+    if (!activeJobId) {
+      setActiveJob(null);
+      return;
+    }
+
+    void loadActiveJob(activeJobId);
+    const timer = setInterval(() => {
+      void loadActiveJob(activeJobId);
+    }, 2000);
+
+    return () => clearInterval(timer);
+  }, [activeJobId, loadActiveJob]);
+
+  useEffect(() => {
+    for (const timer of Object.values(saveTimersRef.current)) {
+      clearTimeout(timer);
+    }
+    saveTimersRef.current = {};
+    dirtyByKeyRef.current = {};
+
+    if (!activeJobId) {
+      setCreativeFiles([]);
+      setSelectedFileKey(null);
+      setDraftByKey({});
+      setSaveStateByKey({});
+      return;
+    }
+
+    void loadCreativeFiles(activeJobId);
+    const timer = setInterval(() => {
+      void loadCreativeFiles(activeJobId);
+    }, 4000);
+
+    return () => clearInterval(timer);
+  }, [activeJobId, loadCreativeFiles]);
+
+  useEffect(() => {
+    const saveTimers = saveTimersRef.current;
+    return () => {
+      for (const timer of Object.values(saveTimers)) {
+        clearTimeout(timer);
+      }
+    };
+  }, []);
 
   function updateAnswer(value: string) {
     if (!currentStep) return;
@@ -129,31 +372,59 @@ export default function Home() {
     setStepIndex(0);
   }
 
-  async function startMovieProduction() {
-    if (!convexConfigured) {
-      setSubmitError(
-        "Set NEXT_PUBLIC_CONVEX_URL in your environment before starting a movie job.",
-      );
-      return;
+  function onEditSelectedFile(value: string) {
+    if (!selectedFileKey) return;
+
+    dirtyByKeyRef.current[selectedFileKey] = true;
+    setDraftByKey((prev) => ({ ...prev, [selectedFileKey]: value }));
+    setSaveStateByKey((prev) => ({ ...prev, [selectedFileKey]: "saving" }));
+
+    const existingTimer = saveTimersRef.current[selectedFileKey];
+    if (existingTimer) {
+      clearTimeout(existingTimer);
     }
 
+    saveTimersRef.current[selectedFileKey] = setTimeout(() => {
+      void saveFile(selectedFileKey, value);
+    }, 900);
+  }
+
+  function saveLabel(fileKey: string): string {
+    const saveState = saveStateByKey[fileKey] ?? "idle";
+    if (saveState === "saving") return "Saving...";
+    if (saveState === "saved") return "Saved";
+    if (saveState === "error") return "Save failed";
+    if (dirtyByKeyRef.current[fileKey]) return "Unsaved changes";
+    return "Idle";
+  }
+
+  async function startMovieProduction() {
     setSubmitError(null);
     setIsSubmittingJob(true);
 
     try {
-      const jobId = (await createMovieAndStartJob({
-        userId: DEMO_USER_ID,
-        title: answers.title,
-        concept: answers.concept,
-        plotOverview: answers.plotOverview,
-        script: answers.script,
-        visualStyle: answers.visualStyle,
-      })) as string;
+      const result = await fetchJson<{ jobId: string }>("/api/jobs", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          userId: DEMO_USER_ID,
+          title: answers.title,
+          concept: answers.concept,
+          plotOverview: answers.plotOverview,
+          script: answers.script,
+          visualStyle: answers.visualStyle,
+        }),
+      });
 
-      setActiveJobId(jobId);
+      setActiveJobId(result.jobId);
+      await loadJobs();
     } catch (error) {
       setSubmitError(
-        error instanceof Error ? error.message : "Failed to start movie generation.",
+        error instanceof Error
+          ? error.message
+          : "Failed to start movie generation.",
       );
     } finally {
       setIsSubmittingJob(false);
@@ -169,6 +440,19 @@ export default function Home() {
 
   function statusLabel(status: JobStatus) {
     return status.charAt(0).toUpperCase() + status.slice(1);
+  }
+
+  function stageLabel(stage?: JobStage) {
+    if (!stage) return "Queued";
+    if (stage === "pre_production") return "Step 1: Pre-production";
+    if (stage === "production_pending") return "Step 2 pending";
+    if (stage === "production") return "Step 2: Production";
+    if (stage === "idea") return "Idea";
+    if (stage === "story") return "Story";
+    if (stage === "screenplay") return "Screenplay";
+    if (stage === "scene_plan") return "Scene plan";
+    if (stage === "scene_generation") return "Scene generation";
+    return stage.charAt(0).toUpperCase() + stage.slice(1);
   }
 
   return (
@@ -187,16 +471,9 @@ export default function Home() {
             </h1>
           </div>
           <p className="rounded-full border border-[#334155] bg-[#0f172a] px-3 py-1 text-xs font-semibold text-[#a5f3fc]">
-            Convex wired
+            Firebase wired
           </p>
         </div>
-
-        {!convexConfigured && (
-          <div className="mb-6 rounded-2xl border border-amber-500/30 bg-amber-950/30 p-4 text-sm text-amber-100">
-            Convex is not configured. Add <code>NEXT_PUBLIC_CONVEX_URL</code> to
-            your environment.
-          </div>
-        )}
 
         {!isReview && (
           <div className="mb-8">
@@ -262,7 +539,8 @@ export default function Home() {
                 Movie setup complete
               </h2>
               <p className="mt-2 text-sm text-[#94a3b8]">
-                You can review everything here. Skipped sections are marked for later.
+                You can review everything here. Skipped sections are marked for
+                later.
               </p>
             </div>
 
@@ -304,7 +582,7 @@ export default function Home() {
               <button
                 type="button"
                 onClick={startMovieProduction}
-                disabled={isSubmittingJob || !convexConfigured}
+                disabled={isSubmittingJob}
                 className="rounded-xl bg-[#0284c7] px-5 py-2.5 text-sm font-semibold text-[#e0f2fe] transition hover:bg-[#0369a1] disabled:cursor-not-allowed disabled:bg-[#334155] disabled:text-[#94a3b8]"
               >
                 {isSubmittingJob ? "Starting..." : "Start movie production"}
@@ -317,10 +595,97 @@ export default function Home() {
               </div>
             )}
 
+            {activeJobId && (
+              <div className="space-y-4 rounded-2xl border border-[#334155] bg-[#0f172a] p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-sm font-semibold text-[#e2e8f0]">
+                    Step 1 docs (.md)
+                  </p>
+                  {activeJob?.stage === "production_pending" && (
+                    <button
+                      type="button"
+                      onClick={startProductionStep}
+                      disabled={isStartingProduction}
+                      className="rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-emerald-50 transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-[#334155] disabled:text-[#94a3b8]"
+                    >
+                      {isStartingProduction
+                        ? "Starting Step 2..."
+                        : "Start Step 2 production"}
+                    </button>
+                  )}
+                </div>
+
+                {filesError && (
+                  <p className="text-sm text-red-200">{filesError}</p>
+                )}
+
+                {preProductionFiles.length > 0 && (
+                  <div className="grid gap-4 md:grid-cols-[220px,1fr]">
+                    <div className="space-y-2">
+                      {preProductionFiles.map((file) => (
+                        <button
+                          key={file.fileKey}
+                          type="button"
+                          onClick={() => setSelectedFileKey(file.fileKey)}
+                          className={`w-full rounded-xl border px-3 py-2 text-left transition ${
+                            selectedFileKey === file.fileKey
+                              ? "border-cyan-400/50 bg-cyan-900/20"
+                              : "border-[#334155] bg-[#020617] hover:border-[#475569]"
+                          }`}
+                        >
+                          <p className="text-xs font-semibold uppercase tracking-[0.12em] text-[#94a3b8]">
+                            {file.title}
+                          </p>
+                          <p className="mt-1 text-xs text-[#64748b]">
+                            {file.fileName}
+                          </p>
+                          <p className="mt-1 text-xs text-[#94a3b8]">
+                            {saveLabel(file.fileKey)}
+                          </p>
+                        </button>
+                      ))}
+                    </div>
+
+                    {selectedFile && (
+                      <div className="space-y-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-xs text-[#94a3b8]">
+                            {selectedFile.fileName}
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void saveFile(
+                                selectedFile.fileKey,
+                                draftByKey[selectedFile.fileKey] ??
+                                  selectedFile.content,
+                              )
+                            }
+                            className="rounded-lg border border-[#475569] px-3 py-1 text-xs font-semibold text-[#cbd5e1] transition hover:border-[#94a3b8] hover:bg-[#1e293b]"
+                          >
+                            Save now
+                          </button>
+                        </div>
+                        <textarea
+                          className="min-h-[320px] w-full resize-y rounded-2xl border border-[#334155] bg-[#020617] px-4 py-3 font-mono text-sm text-[#e2e8f0] outline-none transition placeholder:text-[#64748b] focus:border-[#38bdf8] focus:ring-4 focus:ring-[#0c4a6e]/50"
+                          value={
+                            draftByKey[selectedFile.fileKey] ?? selectedFile.content
+                          }
+                          onChange={(event) => onEditSelectedFile(event.target.value)}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
             {activeJob && (
               <div className="space-y-4 rounded-2xl border border-[#334155] bg-[#0f172a] p-4">
                 <div className="flex items-center justify-between gap-3">
-                  <p className="text-sm font-semibold text-[#e2e8f0]">Live job status</p>
+                  <p className="text-sm font-semibold text-[#e2e8f0]">
+                    Live job status
+                  </p>
                   <span
                     className={`rounded-full border px-3 py-1 text-xs font-semibold ${statusClasses(activeJob.status)}`}
                   >
@@ -329,6 +694,12 @@ export default function Home() {
                 </div>
 
                 <p className="text-sm text-[#94a3b8]">{activeJob.message}</p>
+                <p className="text-xs text-[#94a3b8]">
+                  Stage: {stageLabel(activeJob.stage)}
+                  {typeof activeJob.completedScenes === "number" &&
+                    typeof activeJob.totalScenes === "number" &&
+                    ` (${activeJob.completedScenes}/${activeJob.totalScenes})`}
+                </p>
 
                 <div className="h-2 overflow-hidden rounded-full bg-[#1e293b]">
                   <div
@@ -353,19 +724,30 @@ export default function Home() {
             <div className="space-y-3 rounded-2xl border border-[#334155] bg-[#0f172a] p-4">
               <p className="text-sm font-semibold text-[#e2e8f0]">Job history</p>
 
-              {jobs.length === 0 && (
-                <p className="text-sm text-[#94a3b8]">No jobs yet. Start your first generation.</p>
+              {jobsError && (
+                <p className="text-sm text-red-200">{jobsError}</p>
+              )}
+
+              {jobs.length === 0 && !jobsError && (
+                <p className="text-sm text-[#94a3b8]">
+                  No jobs yet. Start your first generation.
+                </p>
               )}
 
               {jobs.map((job) => (
                 <div
-                  key={job._id}
+                  key={job.id}
                   className="flex flex-col gap-2 rounded-xl border border-[#334155] bg-[#020617] p-3 sm:flex-row sm:items-center sm:justify-between"
                 >
                   <div>
-                    <p className="text-sm font-semibold text-[#e2e8f0]">{job.movieTitle}</p>
+                    <p className="text-sm font-semibold text-[#e2e8f0]">
+                      {job.movieTitle}
+                    </p>
                     <p className="text-xs text-[#94a3b8]">
                       {new Date(job.createdAt).toLocaleString()}
+                    </p>
+                    <p className="text-xs text-[#94a3b8]">
+                      Stage: {stageLabel(job.stage)}
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
